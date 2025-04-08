@@ -11,12 +11,16 @@ import logging
 import subprocess
 import imghdr
 from reverie_sdk import ReverieClient
-import speech_recognition as sr
 import re
 import moviepy.config as mp_config
 from concurrent.futures import ThreadPoolExecutor
 import time
-import keyboard
+import threading
+import sounddevice as sd
+import numpy as np
+import wave
+import google.generativeai as genai
+import tempfile
 
 # Set ImageMagick path
 mp_config.IMAGEMAGICK_BINARY = r"C:\Program Files\ImageMagick-7.1.1-Q16-HDRI\magick.exe"
@@ -48,7 +52,7 @@ db_config = {
     'user': 'root',
     'password': '',
     'host': 'localhost',
-    'database': 'pictory_db'
+    'database': 'picstory_db'
 }
 
 # API Configuration
@@ -56,6 +60,10 @@ GEMINI_API_KEY = "AIzaSyBnrZ6cb6whzoOfCZ0XHEgjzkO555ELCAM"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com"
 GEMINI_API_VERSION = "v1"
 GEMINI_MODEL = "gemini-1.5-flash"
+
+# Configure Gemini API
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 # Initialize Reverie client
 reverie_client = ReverieClient(
@@ -90,7 +98,7 @@ SUPPORTED_LANGUAGES = {
     "23": {"code": "sat-IN", "name": "Santali", "rev_code": "en", "speakers": ["en_male", "en_female"]},
 }
 
-# Custom CSS for better UI
+# Custom CSS
 st.markdown("""
     <style>
     .main {background-color: #f0f2f6;}
@@ -164,8 +172,8 @@ def login(username, password):
 
 @st.cache_data
 def process_input(text_input, media_paths=None):
-    if not text_input or text_input == "Example description or no description":
-        text_input = "A journey through the snowy mountains of Manali in December."
+    if not text_input or text_input == "Enter The Description":
+        text_input = "A journey through breathtaking landscapes during a memorable trip."
     detected_lang = "en"
     gemini_url = f"{GEMINI_BASE_URL}/{GEMINI_API_VERSION}/models/{GEMINI_MODEL}:generateContent"
     try:
@@ -231,10 +239,9 @@ def analyze_single_video(video_path):
     gemini_url = f"{GEMINI_BASE_URL}/{GEMINI_API_VERSION}/models/{GEMINI_MODEL}:generateContent"
     headers = {"Content-Type": "application/json"}
     try:
-        # Extract frames from video
         clip = mp.VideoFileClip(video_path)
         duration = clip.duration
-        frame_interval = max(1, duration / 3)  # Extract up to 3 frames, at least 1 second apart
+        frame_interval = max(1, duration / 3)
         frame_paths = []
         for t in [frame_interval * i for i in range(min(3, int(duration // frame_interval) + 1))]:
             frame_path = os.path.join(TEMP_FOLDER, f"frame_{os.path.basename(video_path)}_{t}.jpg")
@@ -242,7 +249,6 @@ def analyze_single_video(video_path):
             frame_paths.append(frame_path)
         clip.close()
 
-        # Analyze frames
         frame_descriptions = []
         for frame_path in frame_paths:
             with open(frame_path, "rb") as file:
@@ -256,7 +262,6 @@ def analyze_single_video(video_path):
             desc = response.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
             frame_descriptions.append(desc)
         
-        # Combine into a single description
         combined_desc = " ".join(frame_descriptions)
         logger.info(f"Video description for {video_path}: {combined_desc}")
         return combined_desc
@@ -270,7 +275,7 @@ def generate_continuous_story(media_descriptions, user_description, output_langu
     headers = {"Content-Type": "application/json"}
     target_lang = output_language_code.split('-')[0]
     media_desc_text = "\n".join([f"Media {i+1}: {desc}" for i, desc in enumerate(media_descriptions)])
-    prompt = f"Based on the following user description: '{user_description}', and the descriptions of {num_segments} media items (images or videos):\n{media_desc_text}\nGenerate a continuous story in {target_lang} that flows naturally across the media, describing a journey in Manali in December. The story should be cohesive, reflecting the specific details of each media item in sequence, and should include a narrative arc with a beginning, middle, and end. Split the story into exactly {num_segments} non-empty parts, each corresponding to one media item. Each part should be a concise sentence of 15-20 words, suitable for narration within 8 seconds at a normal speaking pace (120-150 words per minute). Ensure each part builds on the previous part and maintains the context of a journey. Return the parts as a list separated by newlines, without any numbering or labels."
+    prompt = f"Based on the following user description: '{user_description}', and the descriptions of {num_segments} media items (images or videos):\n{media_desc_text}\nGenerate a continuous story in {target_lang} that flows naturally across the media, describing a journey. The story should be cohesive, reflecting the specific details of each media item in sequence, and should include a narrative arc with a beginning, middle, and end. Split the story into exactly {num_segments} non-empty parts, each corresponding to one media item. Each part should be a concise sentence of 12-16 words, suitable for narration within 6 seconds at a normal speaking pace (120-150 words per minute). Ensure each part builds on the previous part and maintains the context of a journey. Return the parts as a list separated by newlines, without any numbering or labels."
     payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 500}}
     for attempt in range(3):
         try:
@@ -289,7 +294,7 @@ def generate_continuous_story(media_descriptions, user_description, output_langu
             if attempt == 2:
                 st.error("Failed to generate story after multiple attempts. Please try again.")
                 return None
-    story_segments = [f"In {target_lang}, we continued our journey in Manali, enjoying the scenery of media {i+1}." for i in range(num_segments)]
+    story_segments = [f"In {target_lang}, we continued our journey, enjoying the scenery of media {i+1}." for i in range(num_segments)]
     logger.warning("Using fallback story segments due to repeated failures.")
     return story_segments
 
@@ -419,7 +424,6 @@ def concatenate_videos(video_paths, output_path, background_music_path=None):
             logger=None
         )
         for clip in clips:
-           
             clip.close()
         final_clip.close()
         logger.info(f"Concatenated video saved at {output_path}")
@@ -428,6 +432,41 @@ def concatenate_videos(video_paths, output_path, background_music_path=None):
         logger.error(f"Failed to concatenate videos: {str(e)}")
         st.error(f"Failed to concatenate videos: {str(e)}")
         return False
+
+def record_audio(filename, stop_event: threading.Event, samplerate=44100):
+    """Record audio from the microphone until the stop_event is set."""
+    audio_data = []
+    
+    def callback(indata, frames, time, status):
+        if not stop_event.is_set():
+            audio_data.append(indata.copy())
+        else:
+            raise sd.StopStream()
+
+    try:
+        with sd.InputStream(samplerate=samplerate, channels=1, dtype=np.int16, callback=callback):
+            st.write("Recording.... Press the button again to stop.")
+            while not stop_event.is_set():
+                time.sleep(0.1)
+
+        st.write("Recording Completed.")
+
+        audio_data = np.concatenate(audio_data, axis=0)
+
+        with wave.open(filename, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(samplerate)
+            wf.writeframes(audio_data.tobytes())
+
+    except sd.StopStream:
+        pass
+
+def get_gemini_response(input_msg, audio_path, mime_type="audio/wav"):
+    with open(audio_path, "rb") as f:
+        audio = genai.upload_file(f, mime_type=mime_type)
+    response = model.generate_content([audio, input_msg])
+    return response.text
 
 def process_snippet(args):
     i, media_path, segment, output_lang_code, voice = args
@@ -475,10 +514,10 @@ def main():
     if 'logged_in' not in st.session_state:
         st.session_state.logged_in = False
         st.session_state.user_id = None
-    if 'recording' not in st.session_state:
-        st.session_state.recording = False
+    if 'recording_state' not in st.session_state:
+        st.session_state.recording_state = False
     if 'user_description' not in st.session_state:
-        st.session_state.user_description = "Example description or no description"
+        st.session_state.user_description = "Enter The Description"
     if 'media_paths' not in st.session_state:
         st.session_state.media_paths = None
     if 'story_segments' not in st.session_state:
@@ -552,60 +591,36 @@ def main():
         with col2:
             mic_lang_choice = st.selectbox("Mic Language:", [f"{lang['name']} ({lang['code']})" for lang in SUPPORTED_LANGUAGES.values()], index=0)
             mic_lang_code = SUPPORTED_LANGUAGES[[key for key, val in SUPPORTED_LANGUAGES.items() if f"{val['name']} ({val['code']})" == mic_lang_choice][0]]["code"]
-            
-            if st.button("🎤 Start/Stop Recording"):
-                if not st.session_state.recording:
-                    # Start recording
-                    st.session_state.recording = True
-                    st.write(f"<div class='recording-feedback'>Recording in {mic_lang_code}... Click again to stop</div>", unsafe_allow_html=True)
-                    
-                    # Initialize recognizer
-                    recognizer = sr.Recognizer()
-                    st.session_state.audio_data = []
-                    
-                    # We need to run this in a separate thread to keep the UI responsive
-                    def record_audio():
-                        with sr.Microphone() as source:
-                            recognizer.adjust_for_ambient_noise(source, duration=1)
-                            st.session_state.recording = True
-                            while st.session_state.recording:
-                                try:
-                                    audio = recognizer.listen(source, timeout=1, phrase_time_limit=5)
-                                    st.session_state.audio_data.append(audio)
-                                except sr.WaitTimeoutError:
-                                    continue
-                    
-                    import threading
-                    recording_thread = threading.Thread(target=record_audio)
-                    recording_thread.start()
-                else:
-                    # Stop recording
-                    st.session_state.recording = False
-                    st.write("Processing audio...")
-                    
-                    # Process the recorded audio
-                    full_text = ""
-                    for audio_chunk in st.session_state.audio_data:
-                        try:
-                            text = recognizer.recognize_google(audio_chunk, language=mic_lang_code)
-                            full_text += text + " "
-                        except sr.UnknownValueError:
-                            continue
-                        except sr.RequestError as e:
-                            st.error(f"Speech recognition error: {e}")
-                            continue
-                    
-                    if full_text.strip():
-                        st.session_state.user_description = full_text.strip()
-                        st.success("Transcription complete!")
-                    else:
-                        st.error("No speech detected or could not understand the audio.")
-                    
-                    del st.session_state.audio_data
-                    st.rerun()
 
-            if 'user_description' in st.session_state and st.session_state.user_description != "Example description or no description":
-                st.write(f"Transcribed Description: {st.session_state.user_description}")
+            record_button = st.button("🎤 Record Audio" if not st.session_state.recording_state else "🎤 Stop Recording")
+
+            if record_button:
+                if not st.session_state.recording_state:
+                    st.session_state.recording_state = True
+                    stop_event = threading.Event()
+                    st.session_state.stop_event = stop_event
+
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
+                        temp_path = temp_file.name
+
+                    threading.Thread(target=record_audio, args=(temp_path, stop_event), daemon=True).start()
+                    st.session_state.temp_path = temp_path
+                else:
+                    st.session_state.recording_state = False
+                    st.session_state.stop_event.set()
+
+                    if 'temp_path' in st.session_state:
+                        st.write("Transcribing...")
+                        result = get_gemini_response(f"Transcribe this audio in {mic_lang_code}", st.session_state.temp_path)
+                        if result:
+                            st.session_state.user_description = result.strip()
+                            st.success("Transcription complete!")
+                            st.write(f"Transcribed Description: {st.session_state.user_description}")
+                        else:
+                            st.error("Failed to transcribe audio.")
+                        os.unlink(st.session_state.temp_path)
+                        del st.session_state.temp_path
+                    st.rerun()
 
         language_choice = st.selectbox("Select output language:", [f"{lang['name']} ({lang['code']})" for lang in SUPPORTED_LANGUAGES.values()], index=0)
         output_lang_code = SUPPORTED_LANGUAGES[[key for key, val in SUPPORTED_LANGUAGES.items() if f"{val['name']} ({val['code']})" == language_choice][0]]["code"]
@@ -622,9 +637,7 @@ def main():
                 return
 
             with st.spinner("Processing files and generating story..."):
-                # Clear folders to avoid residual files
                 cleanup_temp()
-
                 file_path = os.path.join(UPLOAD_FOLDER, uploaded_file.name)
                 with open(file_path, "wb") as f:
                     f.write(uploaded_file.getbuffer())
@@ -804,9 +817,4 @@ def main():
                 st.warning("No snippets selected. Please keep at least one snippet to concatenate.")
 
 if __name__ == "__main__":
-    try:
-        import keyboard
-    except ImportError:
-        print("Please install the 'keyboard' module: pip install keyboard")
-        exit()
     main()
